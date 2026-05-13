@@ -1,0 +1,432 @@
+id: autonomous_incident
+namespace: incident.app
+description: Context-aware incident response loop with logs, service ownership, incident memory, native Ollama triage, notification, recovery, verification, and postmortem.
+
+labels:
+  app: autonomous-incident-app
+  phase: "6"
+  triage: ollama
+  notification: gmail
+  safety: policy-gated
+
+inputs:
+  - id: incident_id
+    type: STRING
+    defaults: local-demo-incident
+  - id: service
+    type: STRING
+    defaults: demo-api
+  - id: model
+    type: STRING
+    defaults: qwen3:4b
+  - id: ollama_base_url
+    type: STRING
+    defaults: http://host.docker.internal:11434
+  - id: action
+    type: STRING
+    defaults: restart-demo-api
+  - id: auto_approve
+    type: BOOLEAN
+    defaults: false
+  - id: alert
+    type: JSON
+    defaults: |
+      {
+        "receiver": "manual",
+        "status": "firing",
+        "alerts": [
+          {
+            "status": "firing",
+            "labels": {
+              "alertname": "ManualAppIncident",
+              "severity": "critical",
+              "service": "demo-api"
+            },
+            "annotations": {
+              "summary": "Manual incident app execution"
+            }
+          }
+        ]
+      }
+
+tasks:
+  - id: capture_payload
+    type: io.kestra.plugin.core.debug.Return
+    format: "{{ trigger.body ?? inputs.alert }}"
+
+  - id: service_health
+    type: io.kestra.plugin.core.http.Request
+    uri: http://host.docker.internal:8004/health
+    method: GET
+    options:
+      allowFailed: true
+
+  - id: metrics_snapshot
+    type: io.kestra.plugin.core.http.Request
+    uri: http://host.docker.internal:8004/metrics
+    method: GET
+    options:
+      allowFailed: true
+
+  - id: service_context
+    type: io.kestra.plugin.core.http.Request
+    uri: "http://host.docker.internal:8004/services/{{ inputs.service }}"
+    method: GET
+    options:
+      allowFailed: true
+
+  - id: recent_logs
+    type: io.kestra.plugin.core.http.Request
+    uri: http://host.docker.internal:8004/logs/recent?limit=12
+    method: GET
+    options:
+      allowFailed: true
+
+  - id: incident_history
+    type: io.kestra.plugin.core.http.Request
+    uri: "http://host.docker.internal:8004/incidents/recent?service={{ inputs.service }}&limit=5"
+    method: GET
+    options:
+      allowFailed: true
+
+  - id: triage_with_ollama
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ inputs.ollama_base_url }}/api/chat"
+    method: POST
+    contentType: application/json
+    options:
+      allowFailed: true
+      readTimeout: PT2M
+    body: |
+      {{ {
+        "model": inputs.model,
+        "format": "json",
+        "stream": false,
+        "think": false,
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are an incident responder. Return only raw JSON with keys summary, severity, suspected_cause, evidence, log_signals, owner, runbook, similar_incidents, current_status, recommended_action, confidence, risk. Use current health, current metrics, current logs, service context, and compact incident history literally. If health.healthy is false or demo_api_forced_failure is 1, current_status must be active_failure and recommended_action must be one of the service context safe_actions. If health.healthy is true and demo_api_forced_failure is 0, current_status must be recovered. Never say recovered before recovery when the current health check is failing. If incident_history.count is greater than 0, similar_incidents must list the prior incident IDs and outcomes from incident_history.incidents, but do not copy old triage evidence into the current evidence."
+          },
+          {
+            "role": "user",
+            "content": "Incident ID: " ~ inputs.incident_id ~ ". Alert: " ~ (outputs.capture_payload.value | toJson) ~ ". Health: " ~ (outputs.service_health.body | toJson) ~ ". Metrics: " ~ (outputs.metrics_snapshot.body | toJson) ~ ". Service context: " ~ (outputs.service_context.body | toJson) ~ ". Recent logs: " ~ (outputs.recent_logs.body | toJson) ~ ". Incident history: " ~ (outputs.incident_history.body | toJson)
+          }
+        ]
+      } | toJson }}
+
+  - id: policy_evaluation
+    type: io.kestra.plugin.core.http.Request
+    uri: http://host.docker.internal:8004/policy/evaluate
+    method: POST
+    contentType: application/json
+    options:
+      allowFailed: true
+    body: |
+      {{ {
+        "service": inputs.service,
+        "action": inputs.action,
+        "auto_approve": inputs.auto_approve,
+        "health": outputs.service_health.body,
+        "triage": outputs.triage_with_ollama.body
+      } | toJson }}
+
+  - id: notify_triage
+    type: io.kestra.plugin.core.http.Request
+    uri: http://host.docker.internal:8004/notify
+    method: POST
+    contentType: application/json
+    options:
+      allowFailed: true
+    body: |
+      {{ {
+        "incident_id": inputs.incident_id,
+        "phase": "triage",
+        "severity": "critical",
+        "subject": "[Incident App] Incident triaged: " ~ inputs.incident_id,
+        "summary": "The incident app triaged a demo-api incident and is waiting for approval.",
+        "triage": outputs.triage_with_ollama.body,
+        "evidence": {
+          "alert": outputs.capture_payload.value,
+          "health": outputs.service_health.body,
+          "metrics": outputs.metrics_snapshot.body,
+          "service_context": outputs.service_context.body,
+          "recent_logs": outputs.recent_logs.body,
+          "incident_history": outputs.incident_history.body,
+          "policy": outputs.policy_evaluation.body
+        },
+        "action": inputs.action
+      } | toJson }}
+
+  - id: approval_context
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Incident app approval requested.
+
+      Execution: {{ execution.id }}
+      Incident ID: {{ inputs.incident_id }}
+      Proposed action: {{ inputs.action }}
+      Auto approval: {{ inputs.auto_approve }}
+      Policy:
+      {{ outputs.policy_evaluation.body }}
+
+      Triage:
+      {{ outputs.triage_with_ollama.body }}
+
+      Service health:
+      {{ outputs.service_health.body }}
+
+      Service context:
+      {{ outputs.service_context.body }}
+
+      Recent logs:
+      {{ outputs.recent_logs.body }}
+
+  - id: choose_approval_mode
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.auto_approve and (outputs.policy_evaluation.body contains '\"allowed\":true') }}"
+    then:
+      - id: log_auto_approval
+        type: io.kestra.plugin.core.log.Log
+        message: "Auto-approval enabled and policy allowed the requested action. Continuing recovery."
+
+      - id: execute_recovery_auto
+        type: io.kestra.plugin.core.http.Request
+        uri: "http://host.docker.internal:8004/actions/{{ inputs.action }}"
+        method: POST
+        contentType: application/json
+        body: |
+          {{ {
+            "incident_id": inputs.incident_id,
+            "approved_by": "auto-approval",
+            "reason": "Policy-gated local validation run"
+          } | toJson }}
+
+      - id: verify_recovery_auto
+        type: io.kestra.plugin.core.http.Request
+        uri: http://host.docker.internal:8004/health
+        method: GET
+        options:
+          allowFailed: true
+
+      - id: notify_resolved_auto
+        type: io.kestra.plugin.core.http.Request
+        uri: http://host.docker.internal:8004/notify
+        method: POST
+        contentType: application/json
+        options:
+          allowFailed: true
+        body: |
+          {{ {
+            "incident_id": inputs.incident_id,
+            "phase": "resolved",
+            "severity": "critical",
+            "subject": "[Incident App] Incident recovered: " ~ inputs.incident_id,
+            "summary": "Recovery ran after auto-approval and was verified.",
+            "triage": outputs.triage_with_ollama.body,
+            "evidence": outputs.verify_recovery_auto.body,
+            "action": inputs.action
+          } | toJson }}
+
+      - id: record_incident_auto
+        type: io.kestra.plugin.core.http.Request
+        uri: http://host.docker.internal:8004/incidents
+        method: POST
+        contentType: application/json
+        options:
+          allowFailed: true
+        body: |
+          {{ {
+            "incident_id": inputs.incident_id,
+            "service": inputs.service,
+            "status": "resolved",
+            "severity": "critical",
+            "summary": "Auto-approved incident resolved.",
+            "current_status": "resolved",
+            "recommended_action": inputs.action,
+            "triage": outputs.triage_with_ollama.body,
+            "policy": outputs.policy_evaluation.body,
+            "recovery": outputs.execute_recovery_auto.body,
+            "verification": outputs.verify_recovery_auto.body
+          } | toJson }}
+
+      - id: postmortem_auto
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          # Post-Incident Report
+
+          Incident ID: {{ inputs.incident_id }}
+          Status: resolved
+          Approval: auto-approved
+          Action: {{ inputs.action }}
+          Policy: {{ outputs.policy_evaluation.body }}
+          Triage: {{ outputs.triage_with_ollama.body }}
+          Service context: {{ outputs.service_context.body }}
+          Recent logs: {{ outputs.recent_logs.body }}
+          Similar incidents: {{ outputs.incident_history.body }}
+          Recovery: {{ outputs.execute_recovery_auto.body }}
+          Verification: {{ outputs.verify_recovery_auto.body }}
+          Memory record: {{ outputs.record_incident_auto.body }}
+
+    else:
+      - id: wait_for_approval
+        type: io.kestra.plugin.core.flow.Pause
+        onResume:
+          - id: approved
+            description: Approve the proposed recovery action?
+            type: BOOLEAN
+            defaults: true
+          - id: reason
+            description: Approval or rejection reason
+            type: STRING
+            defaults: Approved by local operator.
+
+      - id: branch_on_approval
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.wait_for_approval.onResume.approved }}"
+        then:
+          - id: execute_recovery
+            type: io.kestra.plugin.core.http.Request
+            uri: "http://host.docker.internal:8004/actions/{{ inputs.action }}"
+            method: POST
+            contentType: application/json
+            body: |
+              {{ {
+                "incident_id": inputs.incident_id,
+                "approved_by": outputs.wait_for_approval.resumed.by ?? "local-operator",
+                "reason": outputs.wait_for_approval.onResume.reason
+              } | toJson }}
+
+          - id: verify_recovery
+            type: io.kestra.plugin.core.http.Request
+            uri: http://host.docker.internal:8004/health
+            method: GET
+            options:
+              allowFailed: true
+
+          - id: notify_resolved
+            type: io.kestra.plugin.core.http.Request
+            uri: http://host.docker.internal:8004/notify
+            method: POST
+            contentType: application/json
+            options:
+              allowFailed: true
+            body: |
+              {{ {
+                "incident_id": inputs.incident_id,
+                "phase": "resolved",
+                "severity": "critical",
+                "subject": "[Incident App] Incident recovered: " ~ inputs.incident_id,
+                "summary": "Recovery was approved and verified.",
+                "triage": outputs.triage_with_ollama.body,
+                "evidence": outputs.verify_recovery.body,
+                "action": inputs.action
+              } | toJson }}
+
+          - id: record_incident
+            type: io.kestra.plugin.core.http.Request
+            uri: http://host.docker.internal:8004/incidents
+            method: POST
+            contentType: application/json
+            options:
+              allowFailed: true
+            body: |
+              {{ {
+                "incident_id": inputs.incident_id,
+                "service": inputs.service,
+                "status": "resolved",
+                "severity": "critical",
+                "summary": "Human-approved incident resolved.",
+                "current_status": "resolved",
+                "recommended_action": inputs.action,
+                "triage": outputs.triage_with_ollama.body,
+                "policy": outputs.policy_evaluation.body,
+                "recovery": outputs.execute_recovery.body,
+                "verification": outputs.verify_recovery.body
+              } | toJson }}
+
+          - id: postmortem
+            type: io.kestra.plugin.core.log.Log
+            message: |
+              # Post-Incident Report
+
+              Incident ID: {{ inputs.incident_id }}
+              Status: resolved
+              Approval: {{ outputs.wait_for_approval.onResume.reason }}
+              Action: {{ inputs.action }}
+              Policy: {{ outputs.policy_evaluation.body }}
+              Triage: {{ outputs.triage_with_ollama.body }}
+              Service context: {{ outputs.service_context.body }}
+              Recent logs: {{ outputs.recent_logs.body }}
+              Similar incidents: {{ outputs.incident_history.body }}
+              Recovery: {{ outputs.execute_recovery.body }}
+              Verification: {{ outputs.verify_recovery.body }}
+              Memory record: {{ outputs.record_incident.body }}
+
+        else:
+          - id: notify_rejected
+            type: io.kestra.plugin.core.http.Request
+            uri: http://host.docker.internal:8004/notify
+            method: POST
+            contentType: application/json
+            options:
+              allowFailed: true
+            body: |
+              {{ {
+                "incident_id": inputs.incident_id,
+                "phase": "rejected",
+                "severity": "critical",
+                "subject": "[Incident App] Recovery rejected: " ~ inputs.incident_id,
+                "summary": "The operator rejected the proposed recovery action.",
+                "triage": outputs.triage_with_ollama.body,
+                "evidence": outputs.service_health.body,
+                "action": inputs.action
+              } | toJson }}
+
+          - id: record_incident_rejected
+            type: io.kestra.plugin.core.http.Request
+            uri: http://host.docker.internal:8004/incidents
+            method: POST
+            contentType: application/json
+            options:
+              allowFailed: true
+            body: |
+              {{ {
+                "incident_id": inputs.incident_id,
+                "service": inputs.service,
+                "status": "rejected",
+                "severity": "critical",
+                "summary": "Operator rejected the proposed recovery action.",
+                "current_status": "active_failure",
+                "recommended_action": inputs.action,
+                "triage": outputs.triage_with_ollama.body,
+                "policy": outputs.policy_evaluation.body,
+                "recovery": outputs.wait_for_approval.onResume.reason,
+                "verification": outputs.service_health.body
+              } | toJson }}
+
+          - id: postmortem_rejected
+            type: io.kestra.plugin.core.log.Log
+            message: |
+              # Post-Incident Report
+
+              Incident ID: {{ inputs.incident_id }}
+              Status: recovery rejected
+              Rejection reason: {{ outputs.wait_for_approval.onResume.reason }}
+              Proposed action: {{ inputs.action }}
+              Policy: {{ outputs.policy_evaluation.body }}
+              Triage: {{ outputs.triage_with_ollama.body }}
+              Memory record: {{ outputs.record_incident_rejected.body }}
+
+triggers:
+  - id: alertmanager_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: local-incident-key
+
+outputs:
+  - id: triage_response
+    type: JSON
+    value: "{{ outputs.triage_with_ollama.body }}"
+  - id: notification_response
+    type: JSON
+    value: "{{ outputs.notify_triage.body }}"

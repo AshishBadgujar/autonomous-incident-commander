@@ -1,0 +1,118 @@
+name: autonomous-incident-app
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: k3str4
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d kestra -U kestra"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - incident-net
+
+  kestra:
+    image: kestra/kestra:latest
+    user: root
+    command: server standalone --worker-thread=8 --flow-path /app/flows
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    volumes:
+      - kestra-storage:/app/storage
+      - ./kestra/flows:/app/flows
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx512m"
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driver-class-name: org.postgresql.Driver
+            username: kestra
+            password: k3str4
+        kestra:
+          server:
+            basic-auth:
+              username: ${KESTRA_USERNAME:-admin@local.dev}
+              password: ${KESTRA_PASSWORD:-Admin1234!}
+          anonymous-usage-report:
+            enabled: false
+          tutorial-flows:
+            enabled: false
+          tutorialFlows:
+            enabled: false
+          repository:
+            type: postgres
+          storage:
+            type: local
+            local:
+              base-path: /app/storage
+          queue:
+            type: postgres
+          tasks:
+            tmp-dir:
+              path: /tmp/kestra-wd/tmp
+            scripts:
+              docker:
+                volume-enabled: true
+          url: http://localhost:8080/
+          variables:
+            env-vars-prefix: ""
+    networks:
+      - incident-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    depends_on:
+      - alertmanager
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - incident-net
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    depends_on:
+      - kestra
+    networks:
+      - incident-net
+
+networks:
+  incident-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  kestra-storage:
+  prometheus-data:

@@ -1,0 +1,19 @@
+{
+  "name": "autonomous-incident-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A simple native Node.js app for the Autonomous Incident App local lab.",
+  "scripts": {
+    "infra:up": "docker compose up -d --remove-orphans",
+    "infra:down": "docker compose down --remove-orphans",
+    "native:start": "./scripts/start_native_services.sh",
+    "native:stop": "./scripts/stop_native_services.sh",
+    "native:logs": "tail -f tmp/logs/app.log",
+    "smoke": "./scripts/smoke_test.sh",
+    "demo": "./scripts/demo.sh"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "nodemailer": "^8.0.7"
+  }
+}

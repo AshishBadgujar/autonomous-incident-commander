@@ -1,0 +1,12 @@
+groups:
+  - name: demo-api
+    rules:
+      - alert: DemoApiForcedFailure
+        expr: demo_api_forced_failure == 1
+        for: 10s
+        labels:
+          severity: critical
+          service: demo-api
+        annotations:
+          summary: Demo API is in forced failure mode
+          description: The demo API has been deliberately placed into failure mode. Kestra should ingest this alert and start incident triage.
